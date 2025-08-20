@@ -177,6 +177,7 @@ class SchemaParser:
         r"^(?P<indent>\s*)Segment\s+(?P<seg>[A-Z0-9]{2,3})(?::\d+)?\*",
         re.I,
     )
+    # Some headers include a following 'Tag <SEG>' line; keep current segment until next Segment line
 
     # Element lines common patterns:
     #   - N9-01  128  Reference Identification Qualifier
@@ -189,7 +190,7 @@ class SchemaParser:
     )
     # Cursor schema style element line: starts with element id then '*', e.g., '0128* description'
     RX_ELEMENT_SIMPLE_ID = re.compile(
-        r"^(?P<indent>\s*)(?P<elem>(?:C\d{2,4})|\d{2,4}|[A-Z0-9]{2,5})\*",
+        r"^(?P<indent>\s*)(?P<elem>(?:C\d{2,4})|\d{2,4}|[A-Z0-9]{2,5})(?::\d+)?\*",
         re.I,
     )
     # Composite subelement lines under a composite: '0128:2* ...'
