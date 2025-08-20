@@ -129,8 +129,14 @@ class SchemaParser:
     """
 
     # Section headers (case-insensitive, flexible whitespace)
-    RX_BRANCHING_HEADER = re.compile(r"^\s*INPUT\s+Branching\s+Diagram\b", re.I)
-    RX_DETAILS_HEADER = re.compile(r"^\s*INPUT\s+Record\s+Details\b", re.I)
+    RX_BRANCHING_HEADER = re.compile(
+        r"^\s*(?:INPUT\s+)?Branch\w*\s+Diagram\b.*$",
+        re.I,
+    )
+    RX_DETAILS_HEADER = re.compile(
+        r"^\s*(?:INPUT\s+)?Record\w*\s+Detail\w*\b.*$",
+        re.I,
+    )
 
     # Loop recognition in diagram lines
     RX_LOOP = re.compile(r"\bLoop\b\s*:?\s*(?P<loopname>[A-Za-z0-9_\-\/ ]+)?", re.I)
@@ -146,10 +152,29 @@ class SchemaParser:
         r"^(?P<indent>\s*)(?P<pos>\d{3,4})\b.*?\b(?P<seg>[A-Z0-9]{2,3})\b.*?\bSegment\b",
         re.I,
     )
+    # Generic: accept any line with a segment code and 3-4 digit position, even if 'Segment' keyword is absent
+    RX_SEGMENT_GENERIC = re.compile(
+        r"^(?P<indent>[\s\|\+\-\u2500-\u257F]*)(?:(?P<seg>[A-Z0-9]{2,3})\b.*?\b(?P<pos>\d{3,4})\b|(?P<pos2>\d{3,4})\b.*?\b(?P<seg2>[A-Z0-9]{2,3})\b)",
+        re.I,
+    )
+    # Cursor schema style: "Segment N9* ..." without explicit numeric position code
+    RX_SEGMENT_PREFIXED = re.compile(
+        r"^(?P<indent>\s*)Segment\s+(?P<seg>[A-Z0-9]{2,3})(?::\d+)?\*",
+        re.I,
+    )
+    # Groups act like loops: "Group 1000_N7*" or "Group ST_999:2*"
+    RX_GROUP_PREFIXED = re.compile(
+        r"^(?P<indent>\s*)Group\s+(?P<group>[A-Z0-9_:\-]+)\*",
+        re.I,
+    )
 
     # Record details: segment header lines, e.g., "N9 - Reference Identification"
     RX_DETAILS_SEGMENT_HEADER = re.compile(
         r"^(?P<seg>[A-Z0-9]{2,3})\b\s*(?:\-|\:|\—|\–)?\s*(?P<name>.+)?$",
+        re.I,
+    )
+    RX_DETAILS_SEGMENT_HEADER_PREFIXED = re.compile(
+        r"^(?P<indent>\s*)Segment\s+(?P<seg>[A-Z0-9]{2,3})(?::\d+)?\*",
         re.I,
     )
 
@@ -162,8 +187,14 @@ class SchemaParser:
         r"^(?P<indent>\s*)(?P<seg>[A-Z0-9]{2,3})\s*[-* ]\s*(?P<pos>\d{2})\b.*?\b(?P<elem>(?:C\d{2,4})|[0-9]{2,4}|[A-Z0-9]{2,5})\b",
         re.I,
     )
-    RX_ELEMENT_NO_SEG = re.compile(
-        r"^(?P<indent>\s*)(?P<pos>\d{2})\b.*?\b(?P<elem>(?:C\d{2,4})|[0-9]{2,4}|[A-Z0-9]{2,5})\b",
+    # Cursor schema style element line: starts with element id then '*', e.g., '0128* description'
+    RX_ELEMENT_SIMPLE_ID = re.compile(
+        r"^(?P<indent>\s*)(?P<elem>(?:C\d{2,4})|\d{2,4}|[A-Z0-9]{2,5})\*",
+        re.I,
+    )
+    # Composite subelement lines under a composite: '0128:2* ...'
+    RX_COMPOSITE_SUBELEMENT = re.compile(
+        r"^(?P<indent>\s*)(?P<elem>\d{2,4})(?::(?P<subpos>\d{1,2}))?\*",
         re.I,
     )
 
@@ -252,6 +283,42 @@ class SchemaParser:
                 LOGGER.debug("Diagram segment: %s %s depth=%d", seg, pos, depth)
                 continue
 
+            # Generic segment matcher (no 'Segment' word required)
+            mg = self.RX_SEGMENT_GENERIC.match(line)
+            if mg:
+                indent = mg.group("indent") or ""
+                seg = (mg.group("seg") or mg.group("seg2") or "").upper()
+                pos = (mg.group("pos") or mg.group("pos2") or "").strip()
+                # Sanity checks to reduce false positives
+                if seg and pos and len(seg) in (2, 3) and pos.isdigit():
+                    depth = self._compute_depth(indent)
+                    node = DiagramNode(node_type="segment", label=seg, position_code=pos, depth=depth)
+                    self._attach_node(roots, stack, node)
+                    LOGGER.debug("Diagram segment (generic): %s %s depth=%d", seg, pos, depth)
+                    continue
+
+            # Segment prefixed lines like: "Segment N9* ..."
+            mp = self.RX_SEGMENT_PREFIXED.match(line)
+            if mp:
+                indent = mp.group("indent") or ""
+                seg = mp.group("seg").upper()
+                depth = self._compute_depth(indent)
+                node = DiagramNode(node_type="segment", label=seg, position_code=None, depth=depth)
+                self._attach_node(roots, stack, node)
+                LOGGER.debug("Diagram segment (prefixed): %s depth=%d", seg, depth)
+                continue
+
+            # Group lines act like loop containers
+            mgp = self.RX_GROUP_PREFIXED.match(line)
+            if mgp:
+                indent = mgp.group("indent") or ""
+                groupname = mgp.group("group")
+                depth = self._compute_depth(indent)
+                node = DiagramNode(node_type="loop", label=groupname, position_code=None, depth=depth)
+                self._attach_node(roots, stack, node)
+                LOGGER.debug("Diagram group/loop: %s depth=%d", groupname, depth)
+                continue
+
             # Loop lines
             if self.RX_LOOP.search(line):
                 indent_match = re.match(r"^(\s*)", line)
@@ -267,12 +334,31 @@ class SchemaParser:
             # Ignore unrelated lines in the diagram section
             LOGGER.debug("Ignoring diagram line: %s", line)
 
+        # Fallback: if nothing detected, attempt a full-file tolerant scan
+        if not roots:
+            LOGGER.warning("No segments detected in Branching Diagram; attempting tolerant scan.")
+            for raw_line in lines:
+                line = raw_line.rstrip("\n")
+                mg = self.RX_SEGMENT_GENERIC.match(line)
+                if mg:
+                    seg = (mg.group("seg") or mg.group("seg2") or "").upper()
+                    pos = (mg.group("pos") or mg.group("pos2") or "").strip()
+                    if seg and pos and len(seg) in (2, 3) and pos.isdigit():
+                        node = DiagramNode(node_type="segment", label=seg, position_code=pos, depth=0)
+                        roots.append(node)
+                        LOGGER.debug("Tolerant segment: %s %s", seg, pos)
+
         return roots
 
     def _compute_depth(self, indent: str) -> int:
-        # Treat 2 spaces as one depth level by default; tabs count as 1
-        spaces = indent.count(" ")
-        tabs = indent.count("\t")
+        # Normalize common tree connectors, count spaces/tabs
+        # Examples of connectors: |, +, -, ├, └, │, ─
+        connector_chars = "|+-\u2500\u2502\u2514\u251C"
+        cleaned = indent
+        for ch in connector_chars:
+            cleaned = cleaned.replace(ch, " ")
+        spaces = cleaned.count(" ")
+        tabs = cleaned.count("\t")
         return tabs + max(0, spaces // 2)
 
     def _attach_node(self, roots: List[DiagramNode], stack: List[DiagramNode], node: DiagramNode) -> None:
@@ -294,27 +380,43 @@ class SchemaParser:
         current_seg: Optional[str] = None
         pending_composite: Optional[CompositeDef] = None
         current_indent_for_composite: Optional[int] = None
+        inside_segment_block: bool = False
+        element_order_by_segment: Dict[str, int] = {}
 
         for raw_line in lines:
             line = raw_line.rstrip("\n")
             if not line.strip():
+                # Blank line resets composite state but keeps current segment
+                pending_composite = None
+                current_indent_for_composite = None
                 continue
 
             # New segment header
+            mp_header = self.RX_DETAILS_SEGMENT_HEADER_PREFIXED.match(line)
+            if mp_header:
+                current_seg = mp_header.group("seg").upper()
+                details_map.setdefault(current_seg, [])
+                pending_composite = None
+                current_indent_for_composite = None
+                inside_segment_block = True
+                element_order_by_segment[current_seg] = 0
+                LOGGER.debug("Details segment header (prefixed): %s", current_seg)
+                continue
             m_header = self.RX_DETAILS_SEGMENT_HEADER.match(line)
-            if m_header and len(line.strip().split(" ")[0]) <= 3:
-                # Heuristic: if header token looks like segment code (2-3 chars)
+            if m_header and len(line.strip().split(" ")[0]) <= 3 and not line.strip().lower().startswith("segment "):
                 current_seg = m_header.group("seg").upper()
                 details_map.setdefault(current_seg, [])
                 pending_composite = None
                 current_indent_for_composite = None
+                inside_segment_block = True
+                element_order_by_segment[current_seg] = 0
                 LOGGER.debug("Details segment header: %s", current_seg)
                 continue
 
             # Element line (with or without segment prefix)
             m_element = self.RX_ELEMENT_WITH_SEG.match(line)
             if not m_element:
-                m_element = self.RX_ELEMENT_NO_SEG.match(line)
+                m_element = None
 
             if m_element:
                 indent = m_element.group("indent") or ""
@@ -374,19 +476,57 @@ class SchemaParser:
 
             # If in the middle of a composite, attempt subelement-only match
             if pending_composite is not None:
-                m_sub = self.RX_SUBELEMENT.match(line)
+                m_sub = self.RX_COMPOSITE_SUBELEMENT.match(line)
                 if m_sub:
-                    subelem = m_sub.group("subelem").upper()
-                    subpos = m_sub.group("subpos")
+                    subelem = m_sub.group("elem").upper()
+                    subpos = m_sub.group("subpos")  # may be None; we'll normalize later
                     pending_composite.subelements.append(
                         ElementDef(element_id=subelem, position_within_segment=subpos)
                     )
                     LOGGER.debug(
-                        "Subelement (fallback) under %s: %s pos=%s",
+                        "Subelement under %s: %s pos=%s",
                         pending_composite.composite_id,
                         subelem,
                         subpos,
                     )
+                    continue
+
+            # Elements without explicit segment or position, e.g., '0128* ...' or composite 'C040*'
+            if current_seg is not None:
+                msimple = self.RX_ELEMENT_SIMPLE_ID.match(line)
+                if msimple:
+                    indent = msimple.group("indent") or ""
+                    elem = msimple.group("elem").upper()
+
+                    # Composite start
+                    if elem.startswith("C") and elem[1:].isdigit():
+                        pending_composite = CompositeDef(
+                            composite_id=elem,
+                            position_within_segment=None,
+                            subelements=[],
+                        )
+                        details_map[current_seg].append(pending_composite)
+                        current_indent_for_composite = len(indent)
+                        LOGGER.debug("Composite start (simple): %s seg=%s", elem, current_seg)
+                        continue
+
+                    # If under a composite and indentation suggests subelement but without ':N', treat as subelement without explicit subpos
+                    if pending_composite is not None and current_indent_for_composite is not None and len(indent) > current_indent_for_composite:
+                        pending_composite.subelements.append(
+                            ElementDef(element_id=elem, position_within_segment=None)
+                        )
+                        LOGGER.debug(
+                            "Subelement (indent) under %s: %s",
+                            pending_composite.composite_id,
+                            elem,
+                        )
+                        continue
+
+                    # Otherwise, a simple segment-level element
+                    details_map[current_seg].append(
+                        ElementDef(element_id=elem, position_within_segment=None)
+                    )
+                    LOGGER.debug("Element (simple): %s seg=%s", elem, current_seg)
                     continue
 
             # Ignore unrecognized detail lines
@@ -418,9 +558,16 @@ def build_output_json(
 
     result: Dict[str, Dict[str, Dict[str, str]]] = {}
 
+    # Assign sequential 4-digit position codes if missing: 0100, 0200, ...
+    sequential_counter = 0
+
     for segment_node in segments:
         seg_code = segment_node.label
-        pos_code = segment_node.position_code or "0000"
+        if segment_node.position_code and segment_node.position_code.isdigit():
+            pos_code = segment_node.position_code.zfill(4)
+        else:
+            sequential_counter += 100
+            pos_code = str(sequential_counter).zfill(4)
         key = f"{seg_code}___{pos_code}___Segment"
 
         element_entries: Dict[str, Dict[str, str]] = {}
@@ -441,7 +588,8 @@ def build_output_json(
                 for sub in element_like.subelements:
                     subordinal += 1
                     subkey = f"{sub.element_id}_{subordinal}"
-                    subpos = _normalize_position(sub.position_within_segment, subordinal)
+                    # For composite subelements, use ordinal-based positions (01, 02, ...)
+                    subpos = _normalize_position(None, subordinal)
                     composite_object[subkey] = {"value": "", "position": subpos}
 
                 # Even if no subelements parsed, still include empty composite mapping
@@ -509,6 +657,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         parser_impl = SchemaParser(text)
         segments_in_order, details_map = parser_impl.parse()
+        LOGGER.info("Parsed segments: %d", len(segments_in_order))
+        LOGGER.info("Parsed details for %d segments", len(details_map))
+        for probe in ("BNX", "N9", "DTM", "BX"):
+            if probe in details_map:
+                LOGGER.info("Details[%s] elements: %d", probe, len(details_map[probe]))
+            else:
+                LOGGER.info("Details[%s] not found", probe)
         edi_json = build_output_json(segments_in_order, details_map)
     except SchemaParserError as exc:
         LOGGER.error("Schema parse error: %s", exc)
